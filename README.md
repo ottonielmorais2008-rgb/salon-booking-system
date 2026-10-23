@@ -89,6 +89,46 @@ CI (GitHub Actions) runs `npm ci`, lint and build on every push and pull request
 - No automated tests yet; the slot and overlap logic in `src/lib/booking.functions.ts` is the first
   candidate.
 
+## What went wrong
+
+These are problems found while checking the booking path against the schema, the policies and CI.
+The list above is what is still open. Each note below is how it showed up, and what changed or is
+still planned.
+
+**The calendar could not see bookings.** `getAvailability` (and the "no preference" picker in
+`createBooking`) reads `bookings` with the public anon client. `SELECT` is granted only to
+`authenticated`, and the RLS policy allows it only when `has_role(..., 'admin')` is true. The
+handler keeps `data` and ignores `error`, so a denied read becomes an empty list. Past times
+and public `time_blocks` still close a slot; existing bookings do not. The overlapping insert is
+still rejected: `no_overlap_per_pro` (`btree_gist` + `tstzrange`) raises `23P01`, and
+`createBooking` maps that to "This time slot was just taken." Planned fix: a `SECURITY DEFINER`
+function that returns busy intervals and no customer fields.
+
+**Salon times were stored with a UTC label.** `wallClockISO` appends `:00.000Z` to the chosen
+date and time. The comment in `src/lib/booking.functions.ts` treats that string as Europe/Lisbon
+wall-clock, shared by client and server for one salon. Lisbon is never converted to UTC, so the
+stored instant is the wall-clock value with a `Z` suffix. Planned fix: convert Europe/Lisbon and
+UTC explicitly.
+
+**The first sign-up became admin.** `handle_new_user` inserts an `admin` role when `user_roles`
+has no admin yet. A follow-up migration hardened the functions around it: `touch_updated_at` now
+sets `search_path`, `EXECUTE` on `handle_new_user` and `touch_updated_at` is revoked from
+`PUBLIC`, `anon` and `authenticated`, `has_role` is revoked from `PUBLIC` and `anon` and granted
+to `authenticated`, and `btree_gist` was moved into the `extensions` schema. The trigger is unchanged. Before a real
+launch, public sign-up has to be disabled in Supabase Auth, or the admin created by hand.
+
+**"No preference" ignores which services a person offers.** There is no table linking
+`professionals` to `services`. Auto-assignment walks that day's `working_hours` and takes the
+first professional whose hours cover the slot. The booking read has the same anon/RLS gap, so the
+check that actually runs is hours plus public time blocks. The chosen person may not offer that
+service. A mapping is still to be added.
+
+**Handlers stayed loosely typed, and the slot logic has no tests.** `assertAdmin` takes
+`supabase: any`, and the admin and booking screens type their rows as `any`. ESLint keeps
+`@typescript-eslint/no-explicit-any` at `warn` until those handlers use the generated Supabase
+types. CI runs `npm ci`, lint and build, and there is no test step. The overlap helpers in
+`src/lib/booking.functions.ts` are the first code that should have tests.
+
 ## How it was built
 
 The first version was generated with Lovable (AI-assisted development) and the build still uses
