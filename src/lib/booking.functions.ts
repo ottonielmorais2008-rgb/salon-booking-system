@@ -3,6 +3,22 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import type { Database } from "@/integrations/supabase/types";
+import {
+  assertBookableStart,
+  availabilitySchema,
+  bookingStatusSchema,
+  bookingWindow,
+  buildBookingRecord,
+  createBookingSchema,
+  dayBounds,
+  evaluateSlots,
+  interpretBookingInsertError,
+  pickProfessional,
+  weekdayFromDate,
+  type AvailabilityInput,
+  type BookingStatus,
+  type CreateBookingInput,
+} from "@/lib/booking-rules";
 
 // Public read-only Supabase client (anon key) — used for public reads during SSR
 function publicClient() {
@@ -10,20 +26,6 @@ function publicClient() {
   return createClient<Database>(process.env.SUPABASE_URL!, key, {
     auth: { storage: undefined, persistSession: false, autoRefreshToken: false },
   });
-}
-
-// Interpret date+time as Europe/Lisbon wall-clock, stored as ISO Z labels
-// (single-salon in one timezone — consistent client<->server).
-function wallClockISO(dateISO: string, timeHHMM: string): string {
-  return `${dateISO}T${timeHHMM}:00.000Z`;
-}
-function addMinutesISO(iso: string, minutes: number): string {
-  const d = new Date(iso);
-  d.setUTCMinutes(d.getUTCMinutes() + minutes);
-  return d.toISOString();
-}
-function overlaps(aStart: string, aEnd: string, bStart: string, bEnd: string): boolean {
-  return aStart < bEnd && bStart < aEnd;
 }
 
 // ================================================================
@@ -52,14 +54,8 @@ export const listProfessionals = createServerFn({ method: "GET" }).handler(async
   return data ?? [];
 });
 
-const availabilitySchema = z.object({
-  serviceId: z.string().uuid(),
-  professionalId: z.string().uuid().nullable(),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-});
-
 export const getAvailability = createServerFn({ method: "POST" })
-  .inputValidator((d: z.infer<typeof availabilitySchema>) => availabilitySchema.parse(d))
+  .inputValidator((d: AvailabilityInput) => availabilitySchema.parse(d))
   .handler(async ({ data }) => {
     const sb = publicClient();
     const { data: svc, error: svcErr } = await sb
@@ -77,7 +73,7 @@ export const getAvailability = createServerFn({ method: "POST" })
     if (proErr) throw new Error(proErr.message);
     if (!pros || pros.length === 0) return { date: data.date, slots: [] };
 
-    const weekday = new Date(`${data.date}T12:00:00Z`).getUTCDay();
+    const weekday = weekdayFromDate(data.date);
 
     // Fetch working hours for these pros on this weekday
     const proIds = pros.map((p) => p.id);
@@ -88,8 +84,7 @@ export const getAvailability = createServerFn({ method: "POST" })
       .eq("weekday", weekday);
 
     // Fetch blocks intersecting the day
-    const dayStart = wallClockISO(data.date, "00:00");
-    const dayEnd = wallClockISO(data.date, "23:59");
+    const { dayStart, dayEnd } = dayBounds(data.date);
     const { data: blocks } = await sb
       .from("time_blocks")
       .select("professional_id,starts_at,ends_at")
@@ -102,69 +97,21 @@ export const getAvailability = createServerFn({ method: "POST" })
       .lt("starts_at", dayEnd)
       .gt("ends_at", dayStart);
 
-    // Build 30-min candidate slots across the union of working hours
-    const slotTimes = new Set<string>();
-    for (const w of wh ?? []) {
-      const [oh, om] = w.open_time.split(":").map(Number);
-      const [ch, cm] = w.close_time.split(":").map(Number);
-      let m = oh * 60 + om;
-      const end = ch * 60 + cm;
-      while (m + duration <= end) {
-        const hh = String(Math.floor(m / 60)).padStart(2, "0");
-        const mm = String(m % 60).padStart(2, "0");
-        slotTimes.add(`${hh}:${mm}`);
-        m += 30;
-      }
-    }
-
-    const now = Date.now();
-    const slots = [...slotTimes].sort().map((time) => {
-      const start = wallClockISO(data.date, time);
-      const end = addMinutesISO(start, duration);
-      if (new Date(start).getTime() < now) return { time, available: false };
-
-      // Slot is available if AT LEAST ONE eligible pro can take it entirely inside their working hours
-      // AND has no overlapping block or booking.
-      const eligible = (wh ?? []).filter((w) => {
-        if (data.professionalId && w.professional_id !== data.professionalId) return false;
-        const [oh, om] = w.open_time.split(":").map(Number);
-        const [ch, cm] = w.close_time.split(":").map(Number);
-        const startM = Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
-        return startM >= oh * 60 + om && startM + duration <= ch * 60 + cm;
-      });
-
-      const anyFree = eligible.some((w) => {
-        const proId = w.professional_id;
-        const hasBlock = (blocks ?? []).some(
-          (b) =>
-            (b.professional_id === null || b.professional_id === proId) &&
-            overlaps(start, end, b.starts_at, b.ends_at),
-        );
-        if (hasBlock) return false;
-        const hasBooking = (bookings ?? []).some(
-          (b) => b.professional_id === proId && overlaps(start, end, b.starts_at, b.ends_at),
-        );
-        return !hasBooking;
-      });
-      return { time, available: anyFree };
+    const slots = evaluateSlots({
+      date: data.date,
+      durationMinutes: duration,
+      professionalId: data.professionalId,
+      workingHours: wh ?? [],
+      blocks: blocks ?? [],
+      bookings: bookings ?? [],
+      nowMs: Date.now(),
     });
 
     return { date: data.date, slots };
   });
 
-const createBookingSchema = z.object({
-  serviceId: z.string().uuid(),
-  professionalId: z.string().uuid().nullable(),
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  time: z.string().regex(/^\d{2}:\d{2}$/),
-  customerName: z.string().trim().min(2).max(100),
-  customerPhone: z.string().trim().min(6).max(30),
-  customerEmail: z.string().trim().email().max(200),
-  notes: z.string().trim().max(500).optional().nullable(),
-});
-
 export const createBooking = createServerFn({ method: "POST" })
-  .inputValidator((d: z.infer<typeof createBookingSchema>) => createBookingSchema.parse(d))
+  .inputValidator((d: CreateBookingInput) => createBookingSchema.parse(d))
   .handler(async ({ data }) => {
     const sb = publicClient();
     const { data: svc } = await sb
@@ -174,24 +121,17 @@ export const createBooking = createServerFn({ method: "POST" })
       .maybeSingle();
     if (!svc) throw new Error("Service not found");
 
-    const starts_at = wallClockISO(data.date, data.time);
-    const ends_at = addMinutesISO(starts_at, svc.duration_minutes);
-    if (new Date(starts_at).getTime() < Date.now()) throw new Error("Cannot book in the past");
+    const { starts_at, ends_at } = bookingWindow(data.date, data.time, svc.duration_minutes);
+    assertBookableStart(starts_at, Date.now());
 
     // Pick professional: if not specified, pick first eligible free one
     let professionalId = data.professionalId;
     if (!professionalId) {
-      const weekday = new Date(`${data.date}T12:00:00Z`).getUTCDay();
+      const weekday = weekdayFromDate(data.date);
       const { data: wh } = await sb
         .from("working_hours")
         .select("professional_id,open_time,close_time")
         .eq("weekday", weekday);
-      const startM = Number(data.time.slice(0, 2)) * 60 + Number(data.time.slice(3));
-      const eligiblePros = (wh ?? []).filter((w) => {
-        const [oh, om] = w.open_time.split(":").map(Number);
-        const [ch, cm] = w.close_time.split(":").map(Number);
-        return startM >= oh * 60 + om && startM + svc.duration_minutes <= ch * 60 + cm;
-      });
       const { data: bookings } = await sb
         .from("bookings")
         .select("professional_id,starts_at,ends_at")
@@ -203,41 +143,32 @@ export const createBooking = createServerFn({ method: "POST" })
         .select("professional_id,starts_at,ends_at")
         .lt("starts_at", ends_at)
         .gt("ends_at", starts_at);
-      for (const w of eligiblePros) {
-        const busy =
-          (bookings ?? []).some((b) => b.professional_id === w.professional_id) ||
-          (blocks ?? []).some(
-            (b) => b.professional_id === null || b.professional_id === w.professional_id,
-          );
-        if (!busy) {
-          professionalId = w.professional_id;
-          break;
-        }
-      }
-      if (!professionalId) throw new Error("No professional available at that time");
+      professionalId = pickProfessional({
+        time: data.time,
+        durationMinutes: svc.duration_minutes,
+        workingHours: wh ?? [],
+        blocks: blocks ?? [],
+        bookings: bookings ?? [],
+      });
     }
+
+    const record = buildBookingRecord({
+      serviceId: data.serviceId,
+      professionalId,
+      starts_at,
+      ends_at,
+      customerName: data.customerName,
+      customerPhone: data.customerPhone,
+      customerEmail: data.customerEmail,
+      notes: data.notes ?? null,
+    });
 
     const { data: inserted, error } = await sb
       .from("bookings")
-      .insert({
-        service_id: data.serviceId,
-        professional_id: professionalId,
-        starts_at,
-        ends_at,
-        status: "pending",
-        customer_name: data.customerName,
-        customer_phone: data.customerPhone,
-        customer_email: data.customerEmail,
-        notes: data.notes ?? null,
-      })
+      .insert(record)
       .select("id")
       .single();
-    if (error) {
-      if (error.message.toLowerCase().includes("no_overlap") || error.code === "23P01") {
-        throw new Error("This time slot was just taken. Please pick another.");
-      }
-      throw new Error(error.message);
-    }
+    if (error) throw interpretBookingInsertError(error);
     return { id: inserted!.id, serviceName: svc.name, starts_at, ends_at, professionalId };
   });
 
@@ -267,10 +198,8 @@ export const adminListBookings = createServerFn({ method: "GET" })
 
 export const adminSetBookingStatus = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: { id: string; status: "pending" | "confirmed" | "cancelled" }) =>
-    z
-      .object({ id: z.string().uuid(), status: z.enum(["pending", "confirmed", "cancelled"]) })
-      .parse(d),
+  .inputValidator((d: { id: string; status: BookingStatus }) =>
+    z.object({ id: z.string().uuid(), status: bookingStatusSchema }).parse(d),
   )
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
