@@ -46,38 +46,38 @@ user_roles (admin) ── has_role() used by the RLS policies
 SQL migrations (schema, policies and fictional seed data) are in
 [`supabase/migrations/`](supabase/migrations).
 
-## Arquitetura
+## Architecture
 
-A marcação atravessa três camadas. O frontend (página pública e painel de administração) chama
-funções de servidor em TanStack Start. Essas funções validam a entrada, lêem e gravam no Supabase
-e aplicam as regras puras de horário em `src/lib/booking-rules.ts`: intervalo do serviço, vagas de
-30 minutos, sobreposição, escolha do profissional e efeito do cancelamento. O Supabase impõe o
-acesso aos dados com Row Level Security e impede duas marcações activas no mesmo profissional.
+A booking crosses three layers. The front end (the public page and the admin panel) calls TanStack
+Start server functions. Those functions validate the input, read and write Supabase, and apply the
+pure scheduling rules in `src/lib/booking-rules.ts`: the service interval, 30-minute slots,
+overlap, professional choice, and what cancellation does. Supabase enforces access with Row Level
+Security and rejects two active bookings for the same professional.
 
 ```mermaid
 flowchart TD
-  cliente["Cliente"] --> pagina["Página de marcação"]
-  equipa["Equipa autenticada"] --> painel["Painel de administração"]
-  pagina --> funcoes["Funções de servidor"]
-  painel --> auth["Supabase Auth"]
-  auth --> funcoesAdmin["Funções de administração"]
-  funcoes --> regras["Regras de marcação"]
-  funcoesAdmin --> regras
-  funcoes --> db[("Supabase PostgreSQL")]
-  funcoesAdmin --> db
+  client["Client"] --> page["Booking page"]
+  team["Signed-in team"] --> panel["Admin panel"]
+  page --> fns["Server functions"]
+  panel --> auth["Supabase Auth"]
+  auth --> adminFns["Admin functions"]
+  fns --> rules["Booking rules"]
+  adminFns --> rules
+  fns --> db[("Supabase PostgreSQL")]
+  adminFns --> db
   db --> rls["Row Level Security"]
-  rls --> pInsert["anon e authenticated: inserir marcação apenas com estado pending"]
-  rls --> pAdmin["authenticated com papel admin: ler, confirmar, cancelar ou apagar marcações"]
-  rls --> pPublic["anon e authenticated: ler serviços activos, profissionais, horários e bloqueios"]
-  rls --> pOverlap["no_overlap_per_pro: sem sobreposição por profissional; canceladas não ocupam o horário"]
+  rls --> pInsert["anon and authenticated: insert a booking only when its status is pending"]
+  rls --> pAdmin["authenticated admin: read, confirm, cancel, or delete bookings"]
+  rls --> pPublic["anon and authenticated: read active services, professionals, hours, and time blocks"]
+  rls --> pOverlap["no_overlap_per_pro: no overlap per professional; cancelled bookings do not occupy the slot"]
 ```
 
-O fluxo de uma marcação é o seguinte:
+A booking follows these steps:
 
-1. O cliente escolhe o serviço, o profissional (ou sem preferência), o dia e a hora.
-2. `getAvailability` calcula as vagas a partir do horário de trabalho, dos bloqueios e das marcações que não estão canceladas.
-3. `createBooking` recusa um horário no passado, atribui o primeiro profissional livre quando não há preferência e grava a marcação como `pending`.
-4. Quem tem o papel de admin confirma ou cancela. Uma marcação cancelada deixa de ocupar o horário.
+1. The client chooses a service, a professional (or no preference), a day, and a time.
+2. `getAvailability` builds the slots from working hours, time blocks, and bookings that are not cancelled.
+3. `createBooking` rejects a time in the past, assigns the first free professional when there is no preference, and stores the booking as `pending`.
+4. An admin confirms or cancels it. A cancelled booking no longer occupies the slot.
 
 ## Getting started
 
@@ -104,16 +104,16 @@ Apply the migrations with the [Supabase CLI](https://supabase.com/docs/guides/cl
 | `npm run format` | Format the code with Prettier |
 | `npm run build` | Production build |
 
-## Testes
+## Tests
 
-Os testes unitários cobrem as regras de marcação e não precisam de Supabase nem de navegador.
+The unit tests cover the booking rules. They do not need Supabase or a browser.
 
 ```bash
 npm test
 ```
 
-O comando executa o Vitest uma vez (`vitest run`) sobre `src/lib/booking-rules.test.ts`. A
-integração contínua corre o mesmo comando depois do lint e da compilação.
+The command runs Vitest once (`vitest run`) on `src/lib/booking-rules.test.ts`. Continuous
+integration runs the same command after lint and the production build.
 
 CI (GitHub Actions) runs `npm ci`, lint, build and `npm test` on every push and pull request.
 
