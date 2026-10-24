@@ -46,6 +46,39 @@ user_roles (admin) ── has_role() used by the RLS policies
 SQL migrations (schema, policies and fictional seed data) are in
 [`supabase/migrations/`](supabase/migrations).
 
+## Arquitetura
+
+A marcação atravessa três camadas. O frontend (página pública e painel de administração) chama
+funções de servidor em TanStack Start. Essas funções validam a entrada, lêem e gravam no Supabase
+e aplicam as regras puras de horário em `src/lib/booking-rules.ts`: intervalo do serviço, vagas de
+30 minutos, sobreposição, escolha do profissional e efeito do cancelamento. O Supabase impõe o
+acesso aos dados com Row Level Security e impede duas marcações activas no mesmo profissional.
+
+```mermaid
+flowchart TD
+  cliente["Cliente"] --> pagina["Página de marcação"]
+  equipa["Equipa autenticada"] --> painel["Painel de administração"]
+  pagina --> funcoes["Funções de servidor"]
+  painel --> auth["Supabase Auth"]
+  auth --> funcoesAdmin["Funções de administração"]
+  funcoes --> regras["Regras de marcação"]
+  funcoesAdmin --> regras
+  funcoes --> db[("Supabase PostgreSQL")]
+  funcoesAdmin --> db
+  db --> rls["Row Level Security"]
+  rls --> pInsert["anon e authenticated: inserir marcação apenas com estado pending"]
+  rls --> pAdmin["authenticated com papel admin: ler, confirmar, cancelar ou apagar marcações"]
+  rls --> pPublic["anon e authenticated: ler serviços activos, profissionais, horários e bloqueios"]
+  rls --> pOverlap["no_overlap_per_pro: sem sobreposição por profissional; canceladas não ocupam o horário"]
+```
+
+O fluxo de uma marcação é o seguinte:
+
+1. O cliente escolhe o serviço, o profissional (ou sem preferência), o dia e a hora.
+2. `getAvailability` calcula as vagas a partir do horário de trabalho, dos bloqueios e das marcações que não estão canceladas.
+3. `createBooking` recusa um horário no passado, atribui o primeiro profissional livre quando não há preferência e grava a marcação como `pending`.
+4. Quem tem o papel de admin confirma ou cancela. Uma marcação cancelada deixa de ocupar o horário.
+
 ## Getting started
 
 Requirements: Node.js 20+ and a Supabase project.
@@ -67,10 +100,22 @@ Apply the migrations with the [Supabase CLI](https://supabase.com/docs/guides/cl
 |---|---|
 | `npm run dev` | Start the dev server |
 | `npm run lint` | ESLint + Prettier checks |
+| `npm run test` | Unit tests for the booking rules |
 | `npm run format` | Format the code with Prettier |
 | `npm run build` | Production build |
 
-CI (GitHub Actions) runs `npm ci`, lint and build on every push and pull request.
+## Testes
+
+Os testes unitários cobrem as regras de marcação e não precisam de Supabase nem de navegador.
+
+```bash
+npm test
+```
+
+O comando executa o Vitest uma vez (`vitest run`) sobre `src/lib/booking-rules.test.ts`. A
+integração contínua corre o mesmo comando depois do lint e da compilação.
+
+CI (GitHub Actions) runs `npm ci`, lint, build and `npm test` on every push and pull request.
 
 ## Known issues / roadmap
 
@@ -86,8 +131,8 @@ CI (GitHub Actions) runs `npm ci`, lint and build on every push and pull request
 - **Professional ↔ service mapping** is not modelled yet: auto-assignment may pick a professional
   who does not offer that service.
 - Some admin and booking handlers still use `any` (reported as lint warnings).
-- No automated tests yet; the slot and overlap logic in `src/lib/booking.functions.ts` is the first
-  candidate.
+- Slot, overlap and cancellation rules are covered by `npm test`. The availability query still
+  cannot see existing bookings under the current RLS policies (see below).
 
 ## What went wrong
 
@@ -123,11 +168,10 @@ first professional whose hours cover the slot. The booking read has the same ano
 check that actually runs is hours plus public time blocks. The chosen person may not offer that
 service. A mapping is still to be added.
 
-**Handlers stayed loosely typed, and the slot logic has no tests.** `assertAdmin` takes
-`supabase: any`, and the admin and booking screens type their rows as `any`. ESLint keeps
-`@typescript-eslint/no-explicit-any` at `warn` until those handlers use the generated Supabase
-types. CI runs `npm ci`, lint and build, and there is no test step. The overlap helpers in
-`src/lib/booking.functions.ts` are the first code that should have tests.
+**Handlers stayed loosely typed.** `assertAdmin` takes `supabase: any`, and the admin and booking
+screens type their rows as `any`. ESLint keeps `@typescript-eslint/no-explicit-any` at `warn`
+until those handlers use the generated Supabase types. The overlap rules now live in
+`src/lib/booking-rules.ts` and are covered by `npm test`; CI runs that step after lint and build.
 
 ## How it was built
 
